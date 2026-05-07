@@ -1,0 +1,177 @@
+# =============================================================================
+# hades-kat-bot — operator config template
+# Copy this file to config.toml and tune for your account.
+# Secret-y fields (RPC URL, API keys, webhooks) live in .env, not here.
+# =============================================================================
+
+# Wallet Configuration
+wallet_path = "wallet.json"
+# Generate a new wallet with: solana-keygen new --outfile wallet.json
+
+# Token Feeds — start with everything off; enable one feed at a time when testing.
+birdeye_token_feed = false
+coingecko_token_feed = false
+target_wallet_token_feed = false
+new_token_event_feed = false
+
+# Exchange Configuration
+pumpfun_enabled = true
+pumpswap_enabled = true
+
+# Trading Configuration
+[trading]
+# Maximum slippage tolerance (percentage). Sells escalate from this base value
+# in +10pp increments on each retry, capped at 99%.
+max_slippage = 5.0
+# Maximum amount to spend on a single buy (lamports). 0.05 SOL is a small,
+# safe starter; raise once you've validated end-to-end behaviour.
+max_buy_amount = 50_000_000  # 0.05 SOL
+# Hard take-profit %. Suppressed when dynamic_trailing_stop_thresholds is set.
+profit_target_percent = 20.0
+# Hard stop loss %, always active.
+stop_loss_percent = 15.0
+# Cooldown between trades on the same token (seconds).
+cooldown_seconds = 60
+# Maximum number of concurrent positions.
+max_positions = 1
+# How often to check exit conditions for open positions (milliseconds).
+exit_check_interval_ms = 1_000
+# Dynamic trailing stop: "gain%:trail%" pairs, comma-separated.
+# When peak PnL crosses a gain tier, exit if it drops trail% from peak.
+# Empty string disables trailing — the hard profit target above is then used.
+dynamic_trailing_stop_thresholds = ""
+
+# Birdeye API Configuration
+# The actual API key is read from BIRDEYE_API_KEY in .env.
+[birdeye]
+api_key = ""
+trending_limit = 20
+poll_interval_ms = 300_000  # 5 minutes
+
+# Trending Token Filters (used by Birdeye/GeckoTerminal feeds)
+[trendingtokenfilters]
+min_market_cap = 50_000        # $50K
+max_market_cap = 100_000_000   # $100M
+min_holders = 50
+max_age_hours = 168            # 1 week
+min_liquidity = 50_000
+min_volume_24h = 100_000
+min_holder_density = 25        # holders per $10K mcap
+
+# New Token Watchlist Filters
+# Tokens from PumpPortal are monitored for up to monitor_duration_minutes,
+# enriched via DexScreener, then tested against these filters + enabled strategies.
+[newtokenfilters]
+# Pre-filter: minimum market cap in SOL on arrival (skips dead-on-arrival tokens)
+min_initial_market_cap_sol = 20.0
+# Filters applied once DexScreener data is available (set 0 to disable any filter)
+min_market_cap = 30_000
+max_market_cap = 50_000
+min_holders = 100
+min_liquidity = 0
+min_volume_24h = 0
+# How long to monitor each new token (minutes)
+monitor_duration_minutes = 60
+# Maximum tokens in the watchlist at once (oldest dropped when full)
+watchlist_cap = 200
+# Polling frequency: initial (seconds), then reduced after reduced_poll_after_minutes
+poll_interval_secs = 15
+reduced_poll_interval_secs = 60
+reduced_poll_after_minutes = 15
+# Rug detection: drop from peak price to consider token dead (percentage)
+rug_drop_percent = 80.0
+
+# Copy Bot Filters
+# Set enabled = false to disable all copy bot filters.
+# Set any value to 0 to disable that specific filter.
+[copybotfilters]
+enabled = false
+min_market_cap = 1_000
+min_holders = 1
+min_liquidity = 1
+min_volume_24h = 1
+# After selling a token at a loss, block re-buying it for this many minutes
+loss_cooldown_minutes = 60
+# Minimum holders per $10K market cap — blocks tokens with artificially inflated mcap
+min_holder_density = 0
+# Run strategy analysis before buying (true = analyze first, false = buy immediately)
+analysis_step = true
+
+# Exit Strategy Configuration
+# Each strategy can be independently enabled/disabled.
+# The hard stop_loss and trailing_stop system remain active regardless.
+[exitstrategies]
+# How often to re-fetch DexScreener data for open positions (ms)
+enrichment_interval_ms = 30_000
+# Time-based exit: sell after holding for max_hold_minutes
+time_exit_enabled = false
+max_hold_minutes = 60
+# Liquidity exit: sell if on-chain liquidity drops below threshold (SOL)
+liquidity_exit_enabled = false
+min_liquidity_sol = 1.0
+# Velocity exit: sell if price declining faster than threshold % per minute
+velocity_exit_enabled = false
+max_decline_rate_per_min = 20.0
+# Momentum reversal: exit if price below SMA and in loss territory.
+# Catches slow bleeds that velocity misses.
+momentum_reversal_enabled = false
+momentum_reversal_window_secs = 30
+momentum_reversal_min_loss_pct = 5.0
+
+# Wallet Quality Scoring (copy trading only)
+# Scores adjust based on actual SOL P&L: score += pnl_sol * sensitivity
+# Position size is multiplied by wallet score (1.5 = +50%, 0.3 = -70%)
+[walletscoring]
+enabled = true
+initial_score = 1.0
+sensitivity = 5.0
+min_score = 0.1
+max_score = 2.0
+min_trades_for_scoring = 3
+# Remove wallet from .env when score drops to this value (0 = disabled)
+wallet_removal_score = 0.0
+
+# Monitoring Configuration
+# DISCORD_WEBHOOK_URL in .env overrides webhook_url here.
+[monitoring]
+webhook_url = ""
+
+# Alert thresholds
+[monitoring.alert_thresholds]
+max_drawdown_percent = 20.0
+min_daily_profit_percent = 5.0
+max_daily_loss_percent = 15.0
+
+# Buy Strategies — start with everything off and enable one at a time.
+[strategies]
+momentum = false
+mean_reversion = false
+breakout = false
+volume_spike = false
+holder_growth = false
+liquidity_depth = false
+ps_sniper = false
+
+# Strategy Parameters
+[params]
+# Momentum
+min_price_change = 25.0
+min_volume_ratio = 2.0
+# MeanReversion
+max_price_change = -10.0
+min_liquidity_ratio = 0.05
+# Breakout
+min_volume_spike = 1.5
+min_price_momentum = 1.0
+# VolumeSpike
+min_volume_multiplier = 2.0
+min_holder_count = 50.0
+# HolderGrowth
+min_growth_holders = 10.0
+min_growth_market_cap = 3_000.0
+# LiquidityDepth
+min_liq_mcap_ratio = 0.03
+min_liquidity_usd = 5_000.0
+liq_max_market_cap = 5_000_000.0
+# PumpSwapSniper — max age (seconds since graduation) to still fire a buy
+ps_sniper_freshness_secs = 30.0

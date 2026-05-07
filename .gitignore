@@ -1,0 +1,39 @@
+# Rust
+target/
+Cargo.lock
+
+# IDE / tooling
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bot specific
+wallet.json
+bot.lock
+/agents/
+/journals/
+/logs/
+
+# Operator config — checked-in template lives at config.toml.example
+config.toml
+*.log
+metrics.json
+config_backup.toml
+positions.json
+wallet_scores.json
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Build artifacts
+dist/
+build/
+logs/
