@@ -42,9 +42,7 @@ exit_check_interval_ms = 1_000
 dynamic_trailing_stop_thresholds = ""
 
 # Birdeye API Configuration
-# The actual API key is read from BIRDEYE_API_KEY in .env.
 [birdeye]
-api_key = ""
 trending_limit = 20
 poll_interval_ms = 300_000  # 5 minutes
 
