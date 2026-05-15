@@ -1,350 +1,324 @@
 # hades-kat-bot
 
-A Rust-based Solana trading bot for PumpFun tokens. Copy trades from target wallets in real-time via WebSocket, or discover tokens through Birdeye/GeckoTerminal feeds. All execution goes through PumpPortal's `/api/trade-local` endpoint (unsigned transactions signed locally). Positions are monitored using **on-chain pricing only** (bonding curve for active PumpFun tokens, PumpSwap pool vaults for graduated tokens), with all prices denominated in **SOL**. Exit conditions include hard stop-loss, hard profit target, and a multi-tier dynamic trailing stop system. Every buy/sell is logged to a JSONL trade journal.
+A Rust trading bot for Solana pump.fun tokens. It runs up to four independent discovery feeds — **Birdeye** trending, **GeckoTerminal** trending, **copy-trading** of target wallets, and brand-new **pump.fun token creations** — enriches each candidate with market data, scores it through a pluggable engine of seven buy strategies, and trades the ones that signal. Buys and sells are built by PumpPortal's `/api/trade-local` endpoint, signed locally, and submitted through your own RPC. Every open position is monitored on a fast on-chain pricing loop and exited by a layered strategy: hard stop-loss, take-profit, a multi-tier trailing stop, and optional time / velocity / momentum-reversal exits. Copy-traded wallets are graded by realized P&L, so unprofitable ones drop themselves out.
+
+> **Warning — this bot trades real funds on Solana mainnet.** It takes full custody of the wallet at `wallet_path` and buys and sells tokens on its own. Always test with `--dry-run` first, and go live with a small `max_buy_amount` and `max_positions = 1`.
+>
+> **⚠️ Educational use only — see the [Disclaimer](#disclaimer) before running this software.**
 
 ## Features
 
-- **Copy Trading** — Monitor target wallets via RPC WebSocket (`logsSubscribe`), detect PumpFun buys, and mirror them automatically
-- **Strategy-Based Discovery** — Poll Birdeye and GeckoTerminal for trending tokens, enrich via DexScreener, apply filters and strategy analysis
-- **On-Chain Pricing** — All price monitoring uses direct RPC reads (bonding curve PDAs and PumpSwap pool vaults), no external API dependency in the pricing path
-- **Dynamic Trailing Stops** — Multi-tier trailing stop system with configurable gain/trail percentage pairs
-- **Trade Journaling** — Append-only JSONL logs with full trade metadata per session
-- **Risk Management** — Configurable stop-loss, take-profit, position limits, cooldowns, and slippage
-- **Dry Run Mode** — Test the full pipeline without executing real trades
-- **5 Trading Strategies** — Momentum, Mean Reversion, Breakout, Volume Spike, and Holder Growth
+- **Four discovery feeds**, each independently toggleable:
+  - **Birdeye** trending tokens
+  - **GeckoTerminal** trending pools
+  - **Copy trading** — mirrors buys from target wallets via RPC `logsSubscribe`
+  - **New-token feed** — brand-new pump.fun launches via PumpPortal's WebSocket, plus a graduation/migration sniper
+- **7 pluggable buy strategies** — Momentum, Mean Reversion, Breakout, Volume Spike, Holder Growth, Liquidity Depth, and PumpSwap Sniper — each toggleable with its own tunable parameters
+- **On-chain, SOL-denominated pricing** — bonding-curve reserves for pre-graduation tokens, PumpSwap pool vaults for graduated ones; exits are priced on the *realized* sell by simulating the swap
+- **Layered exit engine** — hard stop-loss, hard take-profit, a multi-tier dynamic trailing stop, and optional time, velocity, and momentum-reversal exits
+- **Wallet quality scoring** — copy-traded wallets are scored by realized SOL P&L; a wallet that stays unprofitable is automatically dropped from the target list
+- **Local signing** — PumpPortal returns unsigned transactions; the bot signs with your local keypair and submits through your own RPC, so the private key never leaves the machine
+- **JSONL trade journal** — every buy and sell appended to a timestamped per-session journal file
+- **In-memory monitoring** — win rate, P&L, drawdown, and threshold-based alerts
+- **Dry-run mode** — exercises the entire pipeline without sending a single real transaction
+- **Single-instance lock** — a PID lockfile prevents two copies of the bot running against the same wallet
 
-## Architecture
+## Prerequisites
 
-```
-main.rs (CLI entry point)
-  └── TradingBot (bot.rs) — orchestrator, event loop
-        ├── WalletManager (wallet.rs) — keypair, SOL/token balances
-        ├── StrategyEngine (strategies.rs) — 5 analysis strategies
-        ├── TradingEngine (trading.rs) — position mgmt, buy/sell execution, exit checks
-        ├── MonitoringSystem (monitoring.rs) — metrics, alerts, webhook
-        ├── TradeJournal (bot.rs) — JSONL logging
-        └── pumpportal.rs — all external data:
-              ├── On-chain price reads (bonding curve, PumpSwap)
-              ├── PumpPortal trade-local API (tx construction)
-              ├── DexScreener enrichment (metadata only)
-              ├── Birdeye trending feed
-              ├── GeckoTerminal trending feed
-              └── WebSocket copy-trade listener
-```
+| Tool | Version / type | Why |
+| ---- | -------------- | --- |
+| Rust | edition 2021 — a recent stable toolchain | Solana SDK 1.18 typically needs Rust 1.75+ |
+| A Solana mainnet RPC | HTTP endpoint (the WebSocket URL is derived from it) | All on-chain reads, transaction submission, and the copy-trade `logsSubscribe` stream. A paid provider (Helius, QuickNode, Triton, …) is strongly recommended — the public RPC will not reliably serve `logsSubscribe` or fast reads. |
+| A funded Solana wallet | keypair JSON at `wallet_path` | Acts as trader and signer — needs SOL for buys, fees, and the 0.001 SOL priority fee per trade |
+| A Birdeye API key | optional | Required only if the Birdeye feed is enabled |
+| PumpPortal | reachable endpoint (default `https://pumpportal.fun`) | Builds every buy/sell transaction and serves the new-token / migration WebSocket; no key required |
 
-### Event Loop
-
-The main loop (`bot.rs:run`) uses `tokio::select!` with 4 concurrent arms:
-
-| Arm        | Interval                   | Purpose                                                |
-| ---------- | -------------------------- | ------------------------------------------------------ |
-| Discovery  | `birdeye.poll_interval_ms` | Poll trending feeds, enrich, filter, analyze, trade    |
-| Exit Check | `exit_check_interval_ms`   | On-chain price check for open positions, trigger sells |
-| Copy Trade | Channel receive            | Process detected target wallet buys                    |
-| Status     | 60s                        | Log metrics and check alerts                           |
-
-### Trade Execution Flow
-
-```
-Signal (copy trade or strategy)
-  → PumpPortal /api/trade-local (returns unsigned VersionedTransaction)
-    → Bot signs with local keypair
-      → send_and_confirm_transaction via RPC
-        → Post-buy: read on-chain price for entry, query token balance
-        → Position tracked in TradingEngine
-          → Exit check loop monitors PnL via on-chain reads
-            → Sell triggered → PumpPortal sell → journal logged
-```
-
-### On-Chain Pricing
-
-Two-tier system, no external APIs:
-
-1. **Bonding Curve** (active PumpFun tokens) — Derive PDA from mint, read `virtual_sol_reserves` / `virtual_token_reserves`, calculate `(vsol/1e9) / (vtok/1e6)` = SOL per token
-2. **PumpSwap Pools** (graduated tokens, `complete=1`) — Discover pool via `getTokenLargestAccounts` + owner inspection, cache vault addresses, read base/quote vault balances, calculate `(quote_lamports/1e9) / (base_raw/1e6)`
-
-Pool discovery is expensive (~3-4 RPC calls) but cached per token after first lookup.
-
-## File Summary
-
-| File                | Lines | Purpose                                                           |
-| ------------------- | ----- | ----------------------------------------------------------------- |
-| `src/main.rs`       | 65    | CLI entry point (`--config`, `--debug`, `--dry-run`)              |
-| `src/lib.rs`        | 11    | Module declarations                                               |
-| `src/error.rs`      | 37    | `BotError` enum (10 variants) via `thiserror`                     |
-| `src/config.rs`     | 241   | Config structs, TOML parsing, trailing stop parser                |
-| `src/wallet.rs`     | 74    | Keypair wrapper, SOL/token balance queries                        |
-| `src/strategies.rs` | 243   | 5 entry strategies with configurable parameters                   |
-| `src/trading.rs`    | 773   | Position management, buy/sell execution, exit condition checks    |
-| `src/pumpportal.rs` | 876   | On-chain pricing, API integrations, WebSocket copy-trade listener |
-| `src/bot.rs`        | 808   | Orchestrator, event loop, trade journaling, filters               |
-| `src/monitoring.rs` | 299   | Metrics tracking, alert system, webhook support                   |
-
-## Trading Strategies
-
-Six strategies are available (configured in `[strategies]` and `[params]`). Only **Momentum** is enabled by default.
-
-| Strategy             | Trigger                                                                                  | Confidence Based On    |
-| -------------------- | ---------------------------------------------------------------------------------------- | ---------------------- |
-| **Momentum**         | `price_change_24h >= min_price_change` AND `volume/liquidity >= min_volume_ratio`        | Price change magnitude |
-| **Mean Reversion**   | `price_change_24h <= max_price_change` (dip) AND `liquidity/mcap >= min_liquidity_ratio` | Dip magnitude          |
-| **Breakout**         | `volume/liquidity >= min_volume_spike` AND `price_change >= min_price_momentum`          | Volume spike magnitude |
-| **Volume Spike**     | `volume/liquidity >= min_volume_multiplier` AND `holders >= min_holder_count`            | Volume multiplier      |
-| **Holder Growth**    | `holders >= min_growth_holders` AND `mcap >= min_growth_market_cap`                      | Holder-to-mcap ratio   |
-| **PumpSwap Sniper**  | Token has just graduated from PumpFun to PumpSwap, within `ps_sniper_freshness_secs`     | Always 1.0             |
-
-**PumpSwap Sniper** is fed by two sources running in parallel: PumpPortal's `subscribeMigration` WebSocket channel (push-based, lowest latency), and a transition detector inside the new-token watchlist (any monitored token whose bonding curve disappears is treated as graduated). Events from both sources are deduplicated by mint. No filters from `[newtokenfilters]` apply — graduation alone is the entire signal.
-
-## Exit Conditions
-
-Checked every `exit_check_interval_ms` (default 250ms) via on-chain price reads:
-
-1. **Hard Stop-Loss** (always active) — Exit if loss exceeds `stop_loss_percent`
-2. **Dynamic Trailing Stop** (if thresholds configured) — When peak PnL crosses a gain tier, exit if current PnL drops `trail%` below peak. Highest crossed tier is active.
-3. **Hard Profit Target** (fallback only) — Exit if PnL exceeds `profit_target_percent`. Only fires when no trailing thresholds are configured.
-
-Example trailing stop config `"5:3,12:4,20:5,35:6,50:7,80:8,120:9"`:
-
-- Peak hits +5% → exit if drops to +2% (5-3)
-- Peak hits +35% → exit if drops to +29% (35-6)
-- Peak hits +120% → exit if drops to +111% (120-9)
-
-## Quick Start
-
-### Prerequisites
-
-- Rust 1.70+
-- A Solana RPC endpoint (QuickNode, Helius, etc.)
-- SOL in a wallet for trading
-
-### Installation
+## Setup
 
 ```bash
-git clone <repository-url>
+# 1. Clone
+git clone https://github.com/hadesbaker/hades-kat-bot.git
 cd hades-kat-bot
+
+# 2. Create the two config files (both are git-ignored — copy the templates)
+cp config.toml.example config.toml   # operator settings: strategies, filters, exits
+cp .env.example .env                  # secrets: RPC URL, API keys, target wallets
+
+# 3. Edit .env and config.toml — see "Configuration" below
+
+# 4. Build
 cargo build --release
 ```
 
-### Configuration
+### Wallet
 
-Two files. Both are git-ignored — copy from the templates and tune locally.
-
-```bash
-cp config.toml.example config.toml   # operator settings (slippage, strategies, filters, ...)
-cp .env.example .env                  # secrets (RPC URL, API keys, webhooks, target wallets)
-```
-
-1. **`.env`** — fill in real values:
-
-```
-# Solana RPC URL — used for all on-chain reads, transaction submission, and
-# WebSocket subscriptions (the bot derives wss:// from this URL).
-SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-
-# Birdeye API key (required only when birdeye_token_feed = true)
-BIRDEYE_API_KEY=
-
-# Discord webhook URL for monitoring alerts (optional)
-DISCORD_WEBHOOK_URL=
-
-# Comma-separated target wallets for copy trading (leave empty if not used)
-TARGET_WALLETS=WalletPubkey1,WalletPubkey2
-
-# PumpPortal API base URL — used for /api/trade-local (HTTP) and /api/data (WS, derived)
-PUMPPORTAL_API_URL=https://pumpportal.fun
-
-# PumpPortal API key — reserved for premium features (not currently sent on any request)
-PUMPPORTAL_API_KEY=
-```
-
-2. **`config.toml`** — open it and tune trading parameters, strategy toggles, and filter thresholds. The example ships with everything off; flip the strategies you want and start with a small `max_buy_amount`.
-
-`SOLANA_RPC_URL` is required for live trading. The free `api.mainnet-beta.solana.com` endpoint is heavily rate-limited; use a paid provider (QuikNode, Helius, etc.) in production. `PUMPPORTAL_API_URL` defaults to `https://pumpportal.fun` if unset; override only if PumpPortal moves the endpoint or you front it with a proxy.
-
-The values in `BIRDEYE_API_KEY` and `DISCORD_WEBHOOK_URL` override the corresponding fields in `config.toml` (`[birdeye] api_key`, `[monitoring] webhook_url`) if set, so you can keep `config.toml` free of secrets.
-
-### Running
+The bot loads a Solana keypair from `wallet_path` (default `wallet.json`). If that file does not exist it **auto-generates a fresh keypair** on first run — so make sure you fund the address it prints at startup, and that you are pointing at the wallet you intend. To create one yourself instead:
 
 ```bash
-# Dry run (recommended first)
+solana-keygen new --outfile wallet.json
+```
+
+`wallet.json` is git-ignored — never commit it.
+
+## Running
+
+```bash
+# Dry run — runs the full pipeline (feeds, discovery, strategy analysis, exit
+# checks) but submits no real buys or sells. Recommended first.
 cargo run --release -- --dry-run
 
-# Debug logging
-cargo run --release -- --debug
-
-# Custom config path
-cargo run --release -- --config my-config.toml
-
-# Live trading
+# Live
 cargo run --release
 ```
 
-To save logs to a file while still seeing them in the terminal, force `env_logger` to keep ANSI colors enabled (it disables them by default when stdout is piped):
+Flags:
+
+- `--dry-run` — simulate only; logs "DRY RUN: Would…" instead of sending transactions
+- `-d`, `--debug` — set the log level to `debug` instead of `info`
+- `-c`, `--config <FILE>` — use an alternate config file (default `config.toml`)
+
+### Logging
+
+Logging goes through `env_logger`. Verbosity is `info` by default, `debug` with `--debug`, and the standard `RUST_LOG` environment variable overrides both. The bot writes no log file of its own — to keep one, redirect output:
 
 ```bash
-RUST_LOG_STYLE=always cargo run --release 2>&1 | tee logs/run.log
+cargo run --release 2>&1 | tee logs/run.log
 ```
 
-The terminal renders the colors; the file stores the raw ANSI escape codes (view with `less -R` or `cat`).
+The one structured file the bot does write is the per-session trade journal (see [How it works](#how-it-works)).
 
-To keep colors in the terminal but strip them from the saved file:
+## Configuration
 
-```bash
-RUST_LOG_STYLE=always cargo run --release 2>&1 | tee >(sed 's/\x1b\[[0-9;]*m//g' > logs/run.log)
+The bot reads two files. **Secrets** live in `.env`; **operator tuning** lives in `config.toml`. Both are git-ignored — copy them from `.env.example` / `config.toml.example`. Where the two overlap, `.env` wins.
+
+### `.env`
+
+| Variable | Purpose |
+| -------- | ------- |
+| `SOLANA_RPC_URL` | RPC endpoint for all on-chain reads and transaction submission; the WebSocket URL is derived from it. Overrides the config's RPC URL. |
+| `BIRDEYE_API_KEY` | Birdeye API key — required only when the Birdeye feed is on. Overrides `[birdeye] api_key`. |
+| `DISCORD_WEBHOOK_URL` | Webhook URL for monitoring alerts. Overrides `[monitoring] webhook_url`. |
+| `TARGET_WALLETS` | Comma-separated base58 wallet addresses to copy-trade |
+| `PUMPPORTAL_API_URL` | PumpPortal base URL — `/api/trade-local` (HTTP) and `/api/data` (WebSocket). Defaults to `https://pumpportal.fun`. |
+| `PUMPPORTAL_API_KEY` | Reserved for PumpPortal premium features; currently unused |
+
+> Keep API keys in `.env`, not `config.toml` — the `config.toml.example` header says as much. `.env` is the intended home for every secret.
+
+### `config.toml`
+
+`config.toml.example` is fully commented; the tables below summarize each section.
+
+**Top level**
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `wallet_path` | `"wallet.json"` | Path to the keypair file |
+| `birdeye_token_feed` | `false` | Enable the Birdeye trending feed |
+| `coingecko_token_feed` | `false` | Enable the GeckoTerminal trending feed |
+| `target_wallet_token_feed` | `false` | Enable copy trading from `TARGET_WALLETS` |
+| `new_token_event_feed` | `false` | Enable the new-pump.fun-token feed |
+| `pumpfun_enabled` / `pumpswap_enabled` | `true` | Allow trading bonding-curve / graduated tokens |
+
+**`[trading]`**
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `max_slippage` | `5.0` | Base sell slippage %; escalates +10pp per retry, capped at 99% |
+| `max_buy_amount` | `50_000_000` | Maximum spend per buy, in lamports (here 0.05 SOL) |
+| `profit_target_percent` | `20.0` | Hard take-profit %; suppressed when trailing stops are configured |
+| `stop_loss_percent` | `15.0` | Hard stop-loss %, always active |
+| `cooldown_seconds` | `60` | Minimum seconds between trades on the same token |
+| `max_positions` | `1` | Maximum concurrently open positions |
+| `exit_check_interval_ms` | `1_000` | How often open positions are re-priced and exit-checked |
+| `dynamic_trailing_stop_thresholds` | `""` | `gain%:trail%` pairs — see [Strategies](#strategies); empty disables trailing |
+
+**`[birdeye]`**
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `api_key` | `""` | Leave blank — set `BIRDEYE_API_KEY` in `.env` instead |
+| `trending_limit` | `20` | Trending tokens fetched per cycle |
+| `poll_interval_ms` | `300_000` | Discovery-loop interval (drives all trending feeds) |
+
+**`[trendingtokenfilters]`** — applied to Birdeye / GeckoTerminal candidates
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `min_market_cap` / `max_market_cap` | `50_000` / `100_000_000` | Accepted market-cap band (USD) |
+| `min_holders` | `50` | Minimum holder count |
+| `max_age_hours` | `168` | Maximum token age |
+| `min_liquidity` | `50_000` | Minimum liquidity (USD) |
+| `min_volume_24h` | `100_000` | Minimum 24h volume (USD) |
+| `min_holder_density` | `25` | Minimum holders per $10K market cap |
+
+**`[newtokenfilters]`** — applied to the new-token watchlist
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `min_initial_market_cap_sol` | `20.0` | Pre-filter: minimum market cap (SOL) on arrival |
+| `min_market_cap` / `max_market_cap` | `30_000` / `50_000` | Market-cap band once DexScreener data arrives (USD; `0` disables) |
+| `min_holders` / `min_liquidity` / `min_volume_24h` | `100` / `0` / `0` | Additional thresholds (`0` disables each) |
+| `monitor_duration_minutes` | `60` | How long each new token stays on the watchlist |
+| `watchlist_cap` | `200` | Maximum watchlist size (oldest dropped when full) |
+| `poll_interval_secs` / `reduced_poll_interval_secs` / `reduced_poll_after_minutes` | `15` / `60` / `15` | Price-poll cadence, and when it slows down |
+| `rug_drop_percent` | `80.0` | Drop from peak price that marks a token dead |
+
+**`[copybotfilters]`** — applied to copy-trade candidates
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `enabled` | `false` | Master switch for copy-trade filtering |
+| `min_market_cap` / `min_holders` / `min_liquidity` / `min_volume_24h` | `1_000` / `1` / `1` / `1` | Minimum thresholds (`0` disables each) |
+| `loss_cooldown_minutes` | `60` | After a losing sell, block re-buying that token for this long |
+| `min_holder_density` | `0` | Minimum holders per $10K market cap |
+| `analysis_step` | `true` | `true`: run strategy analysis before copying · `false`: copy immediately |
+
+**`[exitstrategies]`** — optional exits layered on top of stop-loss / trailing
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `enrichment_interval_ms` | `30_000` | How often DexScreener metadata is refreshed for open positions |
+| `time_exit_enabled` / `max_hold_minutes` | `false` / `60` | Sell after holding a position this long |
+| `liquidity_exit_enabled` / `min_liquidity_sol` | `false` / `1.0` | Sell if on-chain liquidity falls below the threshold |
+| `velocity_exit_enabled` / `max_decline_rate_per_min` | `false` / `20.0` | Sell if price falls faster than this %/minute |
+| `momentum_reversal_enabled` / `momentum_reversal_window_secs` / `momentum_reversal_min_loss_pct` | `false` / `30` / `5.0` | Sell on a momentum reversal while in loss territory |
+
+**`[walletscoring]`** — copy-trading only
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `enabled` | `true` | Enable wallet scoring |
+| `initial_score` | `1.0` | Score assigned to a newly seen target wallet |
+| `sensitivity` | `5.0` | Score adjustment factor: `score += pnl_sol × sensitivity` |
+| `min_score` / `max_score` | `0.1` / `2.0` | Score clamp range |
+| `min_trades_for_scoring` | `3` | Minimum trades before a wallet's score is acted on |
+| `wallet_removal_score` | `0.0` | When a wallet's score falls to this, it is removed from `TARGET_WALLETS` (`0` disables removal) |
+
+**`[monitoring]`** and **`[monitoring.alert_thresholds]`**
+
+| Key | Example | Purpose |
+| --- | ------- | ------- |
+| `webhook_url` | `""` | Alert webhook; overridden by `DISCORD_WEBHOOK_URL` |
+| `max_drawdown_percent` | `20.0` | Raise an alert above this drawdown |
+| `min_daily_profit_percent` | `5.0` | Daily-profit alert threshold |
+| `max_daily_loss_percent` | `15.0` | Raise an alert above this daily loss |
+
+**`[strategies]`** — seven booleans, one per strategy: `momentum`, `mean_reversion`, `breakout`, `volume_spike`, `holder_growth`, `liquidity_depth`, `ps_sniper`. Start with everything `false` and enable one at a time.
+
+**`[params]`** — numeric thresholds for the strategies. Each key is named in the [Strategies](#strategies) table below.
+
+## How it works
+
+```
+main()
+  acquire bot.lock (single-instance guard) -> load .env + config.toml
+  -> build wallet, strategy engine, trading engine, monitoring, trade journal
+
+  four feeds run concurrently (each enabled in config.toml):
+    - Birdeye trending        poll every birdeye.poll_interval_ms
+    - GeckoTerminal trending       "          "
+    - copy trading            RPC logsSubscribe on each TARGET_WALLETS address
+    - new-token feed          PumpPortal subscribeNewToken (+ migration sniper)
+
+  a candidate token appears
+    -> enrich it with DexScreener market data
+    -> apply the matching filter set (trending / new-token / copy-bot)
+    -> StrategyEngine scores it with every enabled strategy
+    -> any buy signal with confidence >= 0.5?
+         no  -> skip
+         yes -> TradingEngine.execute_buy
+                  guards: cooldown, max_positions, duplicate
+                  -> PumpPortal /api/trade-local builds the buy transaction
+                  -> sign locally, submit + confirm via your RPC
+                  -> record the Position, save positions.json, journal the buy
+
+  exit loop  (every exit_check_interval_ms, for each open position)
+    -> price the realized sell on-chain (bonding curve or PumpSwap pool)
+    -> compute PnL %, update peak PnL
+    -> sell the FULL position as soon as any exit fires:
+         - hard stop-loss            PnL <= -stop_loss_percent
+         - dynamic trailing stop     PnL fell trail% below peak
+         - hard take-profit          PnL >= profit_target_percent
+         - time / velocity / momentum-reversal exit   (if enabled)
+    -> PumpPortal builds the sell, sign + submit, journal the sell
+    -> copy trades: update the source wallet's quality score
 ```
 
-### Wallet Setup
+Notes:
 
-The bot auto-generates `wallet.json` on first run if it doesn't exist. To import into Phantom:
+- **Confidence gate.** Every strategy emits only *buy* signals; a signal below 0.5 confidence is dropped. Exits are never strategy-driven — they come entirely from the exit loop.
+- **On-chain, realized pricing.** Entry price is what the buy actually paid (SOL spent ÷ tokens received). Exit PnL is measured against a *simulated realized sell* through the curve or pool, not a spot quote — so logged PnL reflects what you would actually receive and will differ from a naive price chart.
+- **Two venues.** Pre-graduation tokens price off the pump.fun bonding curve; once a token graduates (`complete = 1`) it prices off its PumpSwap pool vaults. Pool discovery is cached per token.
+- **Positions persist.** Open positions are saved to `positions.json` and reloaded on restart, so the bot resumes managing them.
+- **Trade journal.** Each run opens a fresh `journals/<timestamp>.jsonl`; every buy and sell is appended as one JSON line (token metadata, SOL in/out, PnL, peak PnL, exit reason, signature).
+- **Single instance.** `bot.lock` holds the running bot's PID; a second instance refuses to start while the first is alive. After a hard crash you may need to delete a stale `bot.lock`.
+- **Wallet self-pruning.** With scoring enabled, a copy-traded wallet whose score falls to `wallet_removal_score` is removed from `TARGET_WALLETS` in `.env` automatically — the bot edits `.env` at runtime.
+- **Sell slippage escalates.** A failing sell is retried with slippage rising +10pp each attempt, up to 99%, to force a stuck position out.
 
-1. Open `wallet.json` — it contains a JSON array of numbers (the keypair bytes)
-2. In Phantom: Add Account -> Import Private Key
-3. Paste the array and name the wallet
-4. Send SOL to the wallet address (logged on bot startup)
+## Strategies
 
-## Configuration Reference
+Each strategy is toggled in `[strategies]` and tuned in `[params]`. Every strategy emits only buy signals, and a signal must reach 0.5 confidence to trade. Start with a single strategy enabled.
 
-### Root Level
+| Strategy | `[strategies]` key | Buys when | Confidence from |
+| -------- | ------------------ | --------- | --------------- |
+| Momentum | `momentum` | 24h price change ≥ `min_price_change` **and** volume/liquidity ≥ `min_volume_ratio` | price-change magnitude |
+| Mean Reversion | `mean_reversion` | 24h price change ≤ `max_price_change` (a dip) **and** liquidity/market-cap ≥ `min_liquidity_ratio` | dip magnitude |
+| Breakout | `breakout` | volume/liquidity ≥ `min_volume_spike` **and** price change ≥ `min_price_momentum` | volume-spike magnitude |
+| Volume Spike | `volume_spike` | volume/liquidity ≥ `min_volume_multiplier` **and** holder count is sufficient | volume multiplier |
+| Holder Growth | `holder_growth` | holders ≥ `min_growth_holders` **and** market cap ≥ `min_growth_market_cap` | holders-to-market-cap ratio |
+| Liquidity Depth | `liquidity_depth` | liquidity ≥ `min_liquidity_usd`, market cap ≤ `liq_max_market_cap`, **and** liquidity/market-cap ≥ `min_liq_mcap_ratio` | liquidity/market-cap ratio |
+| PumpSwap Sniper | `ps_sniper` | a token has just graduated to PumpSwap, within `ps_sniper_freshness_secs` | always 1.0 |
 
-| Variable                   | Default                               | Purpose                            |
-| -------------------------- | ------------------------------------- | ---------------------------------- |
-| `wallet_path`              | `"wallet.json"`                       | Path to keypair file               |
-| `birdeye_token_feed`       | `true`                                | Enable Birdeye trending feed       |
-| `coingecko_token_feed`     | `true`                                | Enable GeckoTerminal trending feed |
-| `target_wallet_token_feed` | `false`                               | Enable copy trading via WebSocket  |
+The PumpSwap Sniper is fed by PumpPortal's `subscribeMigration` channel and by a transition detector in the new-token watchlist (a monitored token whose bonding curve disappears is treated as graduated); the two sources are deduplicated by mint.
 
-The Solana RPC URL is read from the `SOLANA_RPC_URL` environment variable in `.env`, not from `config.toml`.
+### Dynamic trailing stop
 
-### `[trading]`
+`dynamic_trailing_stop_thresholds` is a comma-separated list of `gain%:trail%` pairs. When a position's peak PnL crosses a gain tier, the bot exits if PnL then falls `trail%` below the peak; the highest crossed tier wins. When trailing is configured, the hard `profit_target_percent` is suppressed.
 
-| Variable                           | Default                 | Purpose                                                        |
-| ---------------------------------- | ----------------------- | -------------------------------------------------------------- |
-| `max_slippage`                     | `5.0`                   | Slippage tolerance (%) sent to PumpPortal                      |
-| `min_liquidity`                    | `100,000,000` (100 SOL) | Minimum liquidity filter for strategy discovery (lamports)     |
-| `max_buy_amount`                   | `1,000,000,000` (1 SOL) | Max spend per strategy buy (lamports)                          |
-| `profit_target_percent`            | `20.0`                  | Hard take-profit %, only fires if no trailing stops configured |
-| `stop_loss_percent`                | `10.0`                  | Hard stop-loss %, always active                                |
-| `cooldown_seconds`                 | `60`                    | Min seconds between trades on same token                       |
-| `max_positions`                    | `5`                     | Max concurrent open positions                                  |
-| `exit_check_interval_ms`           | `5,000`                 | How often to poll on-chain prices for exit checks              |
-| `copy_trade_amount_sol`            | `0.1`                   | SOL amount per copy trade                                      |
-| `dynamic_trailing_stop_thresholds` | `""`                    | Tiered trailing stops: `"gain:trail,gain:trail,..."`           |
+Example — `"5:3,12:4,20:5,35:6,50:7,80:8,120:9"`:
 
-### PumpPortal (loaded from `.env`, not `config.toml`)
+- peak hits +5% → exit if it drops to +2%
+- peak hits +35% → exit if it drops to +29%
+- peak hits +120% → exit if it drops to +111%
 
-| Env var              | Default                    | Purpose                                                                  |
-| -------------------- | -------------------------- | ------------------------------------------------------------------------ |
-| `PUMPPORTAL_API_URL` | `https://pumpportal.fun`   | Base URL — `/api/trade-local` for HTTP, `/api/data` (wss://) for WS feed |
-| `PUMPPORTAL_API_KEY` | unset                      | Reserved for premium features (not currently sent on any request)        |
+## Project structure
 
-### `[birdeye]`
+```
+src/
+  main.rs          entry point: CLI parsing, logging, the bot.lock single-instance
+                   guard, config load, builds and runs TradingBot
+  lib.rs           crate root; module declarations
+  error.rs         BotError type and the crate Result alias
+  config.rs        all config structs, .env + config.toml loading, defaults
+  bot.rs           TradingBot orchestrator: feed wiring, the event loop, copy-trade
+                   and graduation handling, candidate filters, journal, wallet scorer
+  wallet.rs        keypair wrapper; SOL and SPL token balance reads
+  strategies.rs    StrategyEngine and the seven buy strategies
+  trading.rs       TradingEngine: buy/sell execution, position state, exit checks,
+                   positions.json persistence
+  tokens.rs        new-token watchlist: bonding-curve polling, rug/graduation
+                   detection, DexScreener enrichment, filter gate
+  pumpportal.rs    all external I/O: on-chain price reads, PumpPortal trade API,
+                   Birdeye / GeckoTerminal / DexScreener HTTP, the WebSocket feeds
+  monitoring.rs    MonitoringSystem: in-memory metrics and threshold alerts
+```
 
-| Variable           | Default           | Purpose                                         |
-| ------------------ | ----------------- | ----------------------------------------------- |
-| `api_key`          | `""`              | Birdeye API key (get from birdeye.so)           |
-| `trending_limit`   | `100`             | Max trending tokens to fetch per cycle          |
-| `poll_interval_ms` | `300,000` (5 min) | Discovery polling interval (used for all feeds) |
+## Disclaimer
 
-### `[filters]`
+**This software is provided for educational and informational purposes only.**
 
-| Variable         | Default      | Purpose                                 |
-| ---------------- | ------------ | --------------------------------------- |
-| `min_market_cap` | `2,800`      | Skip tokens below this market cap (USD) |
-| `max_market_cap` | `10,000,000` | Skip tokens above this market cap (USD) |
-| `min_holders`    | `10`         | Minimum holder count                    |
-| `max_age_hours`  | `48`         | Maximum token age in hours              |
+- **Not financial advice.** Nothing in this repository — code, comments, documentation, or examples — constitutes financial, investment, trading, legal, or tax advice. It is a technical demonstration of automated trading concepts.
+- **Use entirely at your own risk.** Cryptocurrency trading is extremely high risk. Automated trading of newly graduated pump.fun tokens is especially speculative and you should assume you can lose **100% of any funds the bot has access to**. Never run this bot with money you cannot afford to lose entirely.
+- **No warranty.** This software is provided "AS IS", without warranty of any kind, express or implied. It may contain bugs, may execute trades incorrectly, may fail to sell a position, and may lose money — including through software defects, network or RPC failures, slippage, or adverse market conditions.
+- **No liability.** To the maximum extent permitted by law, the author(s) and contributors shall not be liable for any claim, damages, or other liability — including but not limited to any financial losses, lost profits, or lost funds — arising from or in connection with the use of, or inability to use, this software.
+- **You are solely responsible** for how you use this software, for securing your wallet and private keys, for any funds placed at risk, and for complying with all laws, regulations, and third-party terms of service (including those of pump.fun, PumpSwap, PumpPortal, and your RPC provider) applicable in your jurisdiction.
 
-Note: A PumpFun-only filter and a `min_liquidity` filter (from `[trading]`) are also applied during token discovery.
-
-### `[monitoring]`
-
-| Variable      | Default | Purpose                              |
-| ------------- | ------- | ------------------------------------ |
-| `webhook_url` | `None`  | Discord/Slack webhook URL for alerts |
-
-### `[monitoring.alert_thresholds]`
-
-| Variable                   | Default | Purpose                            |
-| -------------------------- | ------- | ---------------------------------- |
-| `max_drawdown_percent`     | `20.0`  | Alert if max drawdown exceeds this |
-| `min_daily_profit_percent` | `5.0`   | Daily profit alert threshold       |
-| `max_daily_loss_percent`   | `15.0`  | Alert if daily loss exceeds this   |
-
-### `[params]` (Strategy Parameters)
-
-| Variable                | Default   | Strategy                                               |
-| ----------------------- | --------- | ------------------------------------------------------ |
-| `min_price_change`      | `5.0`     | Momentum — min 24h price change %                      |
-| `min_volume_ratio`      | `2.0`     | Momentum — min volume/liquidity ratio                  |
-| `max_price_change`      | `-5.0`    | Mean Reversion — max 24h price change (negative = dip) |
-| `min_liquidity_ratio`   | `0.05`    | Mean Reversion — min liquidity/mcap ratio              |
-| `min_volume_spike`      | `1.5`     | Breakout — min volume/liquidity ratio                  |
-| `min_price_momentum`    | `1.0`     | Breakout — min price change %                          |
-| `min_volume_multiplier` | `2.0`     | Volume Spike — min volume/liquidity multiplier         |
-| `min_holder_count`      | `5.0`     | Volume Spike — min holders                             |
-| `min_growth_holders`    | `10.0`    | Holder Growth — min holders                            |
-| `min_growth_market_cap` | `3,000.0` | Holder Growth — min market cap (USD)                   |
-
-### Environment Variables
-
-Loaded from `.env` at startup (via `dotenvy`); shell-exported values also work.
-
-| Variable              | Required     | Default                                | Purpose                                                                  |
-| --------------------- | ------------ | -------------------------------------- | ------------------------------------------------------------------------ |
-| `SOLANA_RPC_URL`      | yes          | `https://api.mainnet-beta.solana.com`  | RPC endpoint for all on-chain reads, tx submission, and WS subscriptions |
-| `BIRDEYE_API_KEY`     | for Birdeye  | unset                                  | Birdeye API key — overrides `[birdeye] api_key` in `config.toml`         |
-| `DISCORD_WEBHOOK_URL` | no           | unset                                  | Webhook URL for alerts — overrides `[monitoring] webhook_url`            |
-| `TARGET_WALLETS`      | for copy     | —                                      | Comma-separated Solana pubkeys to copy trade from                        |
-| `PUMPPORTAL_API_URL`  | no           | `https://pumpportal.fun`               | Base URL for `/api/trade-local` (HTTP) and `/api/data` (WS, derived)     |
-| `PUMPPORTAL_API_KEY`  | no           | unset                                  | Reserved for premium features; not currently sent on any request         |
-
-## Trade Journal
-
-Each bot session creates a JSONL file in `journals/` (e.g., `journals/2026-03-04_14-30-00.jsonl`).
-
-**BUY entry fields**: timestamp, token address/symbol/name, price, market cap, liquidity, holders, volume, sol_spent, tokens_received, tx_signature, source_wallet
-
-**SELL entry fields**: entry_price_sol, exit_price_sol, pnl_percent, peak_pnl_percent, profit_loss_sol, sol_spent, sol_received, exit_reason, tx_signature, source_wallet
-
-## Monitoring
-
-### Metrics Tracked
-
-- Total trades, win/loss count, win rate
-- Total P&L (SOL), average profit/loss per trade
-- Max drawdown
-- Current position count
-- Uptime
-
-### Alert Levels
-
-| Level    | Triggers                                                 |
-| -------- | -------------------------------------------------------- |
-| Warning  | Max drawdown exceeded, win rate < 30% (after 10+ trades) |
-| Error    | Daily loss threshold exceeded                            |
-| Critical | System failures                                          |
-
-## Key Constants
-
-| Constant         | Value                                         |
-| ---------------- | --------------------------------------------- |
-| PumpFun Program  | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` |
-| PumpSwap Program | `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` |
-| SOL Mint         | `So11111111111111111111111111111111111111112` |
-| Priority Fee     | 0.001 SOL                                     |
-| Token Graduation | ~$69K market cap (bonding curve `complete=1`) |
-
-## Security
-
-- **Wallet**: Keypair stored locally in `wallet.json` — never share this file
-- **API Keys**: PumpPortal keys live in `.env` (gitignored); the Birdeye key is in `config.toml`
-- **Local Signing**: PumpPortal returns unsigned transactions; the bot signs locally — your private key never leaves your machine
-- **Dry Run**: Always test with `--dry-run` before live trading
+By using, running, modifying, or distributing this software, you acknowledge that you have read and understood this disclaimer and accept full responsibility for the outcomes.
 
 ## Author
 
-Taki Hades Baker Alyasri
+**Taki Hades Baker Alyasri**
 
 ## License
 
-MIT
+MIT — see the [Disclaimer](#disclaimer) above. The MIT license's "AS IS", no-warranty, and no-liability terms apply to all use of this software.
